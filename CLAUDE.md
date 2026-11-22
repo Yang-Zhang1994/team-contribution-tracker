@@ -93,6 +93,18 @@ Setup: copy `.env.example` to `.env` and fill in `DATABASE_URL` (Postgres/Neon),
 - Don't import from `@prisma/client` (use `@/generated/prisma/client`) or edit `src/generated/`.
 - Don't commit `.env` or skip hooks with `--no-verify`.
 
+## Permissions
+
+`.claude/settings.json` is committed and shared by the team:
+
+- **allow**: runs without a prompt. Covers lint, typecheck, format, tests, `prisma generate`, local git (status/diff/log/branch/switch/add/commit) and read-only `gh` commands.
+- **ask**: always prompts. Covers anything that leaves the machine or changes dependencies or the database: `git push`, `npm install`, `prisma migrate`, `gh pr create`/`merge`.
+- **deny**: always blocked, even if an allow or ask rule matches. Covers reading or editing `.env`, `.env.local` and `.env.*.local` (`.env.example` is fine), editing `src/generated/**`, force-push, `commit --no-verify` and `rm -rf`/`rm -fr`.
+
+Permission rules only match the start of a command, so flag-order tricks like `git commit -m x --no-verify` aren't fully blocked. A PreToolUse hook will enforce these rules in P3.
+
+Put personal overrides in `.claude/settings.local.json`, which is gitignored. Don't loosen the shared deny list.
+
 ## Context management
 
 - `/clear` between unrelated tasks (e.g. after merging one issue's PR, before starting the next) so stale context doesn't leak in. CLAUDE.md and the PRD are reloaded automatically.
