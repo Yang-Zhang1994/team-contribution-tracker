@@ -40,12 +40,12 @@ npx prisma migrate dev       # apply/create migrations (needs DATABASE_URL in .e
 npx prisma generate          # regenerate client (also runs on npm install)
 ```
 
-Setup: copy `.env.example` to `.env` and fill in `DATABASE_URL` (Postgres/Neon), `AUTH_SECRET`, `AUTH_GITHUB_ID` and `AUTH_GITHUB_SECRET`.
+Setup: copy `.env.example` to `.env` and fill in `DATABASE_URL` and `DATABASE_URL_UNPOOLED` (or run `npx neon@latest env pull`), `AUTH_SECRET`, `AUTH_GITHUB_ID` and `AUTH_GITHUB_SECRET`.
 
 ## Architecture notes
 
 - **Next.js 16 with `cacheComponents: true`** (`next.config.ts`). Anything that reads request data (cookies, `auth()`, headers) must render inside a `<Suspense>` boundary. See `src/app/page.tsx` and `src/app/auth-status.tsx`. Check `node_modules/next/dist/docs/` before using Next APIs, since they differ from older versions. `LayoutProps`/`PageProps` route types come from `next typegen`.
-- **Prisma 7**: the client is generated to `src/generated/prisma` (gitignored) and imported from `@/generated/prisma/client`, not `@prisma/client`. It connects through the `@prisma/adapter-pg` driver adapter. The datasource URL is set in `prisma.config.ts` (loaded via dotenv), not in `schema.prisma`. Use the shared singleton `prisma` from `@/server/db`. Server-only code that touches the database or outside services lives in `src/server/`, apart from the pure domain logic in `src/lib/`.
+- **Prisma 7**: the client is generated to `src/generated/prisma` (gitignored) and imported from `@/generated/prisma/client`, not `@prisma/client`. It connects through the `@prisma/adapter-pg` driver adapter. The database is Neon (project linked via `neon.ts`). The app connects with the pooled `DATABASE_URL` through a `pg` Pool registered with `attachDatabasePool` for Vercel; Prisma CLI/migrations use the direct `DATABASE_URL_UNPOOLED`, set in `prisma.config.ts` (loaded via dotenv), not in `schema.prisma`. Use the shared singleton `prisma` from `@/server/db`. Server-only code that touches the database or outside services lives in `src/server/`, apart from the pure domain logic in `src/lib/`.
 - **Auth.js v5** (`src/auth.ts`): GitHub is the only provider, because users are matched to commits/PRs/reviews by their GitHub identity. It uses the Prisma adapter with database sessions. Import `auth`, `signIn` and `signOut` from `@/auth`. The route handler is in `src/app/api/auth/[...nextauth]/route.ts`.
 - **Path alias** `@/*` → `src/*`, configured in both `tsconfig.json` and `vitest.config.ts`.
 - **Tests**: Vitest uses the node environment and only picks up `src/**/*.test.ts` (not `.tsx`). Coverage excludes `src/generated`.
