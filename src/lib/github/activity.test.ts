@@ -121,7 +121,7 @@ describe("toCommitRecord", () => {
   it("maps a commit with its author, author date and filtered line total", () => {
     expect(toCommitRecord(commit(), files)).toEqual({
       sha: "abc123",
-      authorGithubId: 101n,
+      authorGithubId: BigInt(101),
       authorLogin: "alex",
       authorName: "Alex Kim",
       authorEmail: "alex@example.com",
@@ -160,9 +160,9 @@ describe("toCommitRecord", () => {
 describe("toPullRequestRecord", () => {
   it("maps a merged PR", () => {
     expect(toPullRequestRecord(pull())).toEqual({
-      githubId: 9001n,
+      githubId: BigInt(9001),
       number: 7,
-      authorGithubId: 101n,
+      authorGithubId: BigInt(101),
       authorLogin: "alex",
       title: "Add share calculation",
       url: "https://github.com/o/r/pull/7",
@@ -189,8 +189,8 @@ describe("PRD §4.1: reviews count only on a teammate's PR", () => {
 
   it("maps a submitted review on someone else's PR", () => {
     expect(toReviewRecord(review(), prAuthorId)).toEqual({
-      githubId: 5001n,
-      reviewerGithubId: 202n,
+      githubId: BigInt(5001),
+      reviewerGithubId: BigInt(202),
       reviewerLogin: "sam",
       state: "APPROVED",
       url: "https://github.com/o/r/pull/7#pullrequestreview-5001",
