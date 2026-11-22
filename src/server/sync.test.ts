@@ -69,18 +69,20 @@ type FakeData = {
 
 function fakeSource(data: FakeData) {
   const source = {
-    getDefaultBranch: vi.fn(async () => data.defaultBranch ?? "main"),
-    listPullsUpdatedSince: vi.fn(
-      async (_since: Date | null) => data.pulls ?? [],
+    getDefaultBranch: vi.fn<GitHubSource["getDefaultBranch"]>(
+      async () => data.defaultBranch ?? "main",
     ),
-    listReviews: vi.fn(
-      async (prNumber: number) => data.reviews?.[prNumber] ?? [],
+    listPullsUpdatedSince: vi.fn<GitHubSource["listPullsUpdatedSince"]>(
+      async () => data.pulls ?? [],
     ),
-    listCommits: vi.fn(
-      async (_branch: string, _since: Date | null) => data.commits ?? [],
+    listReviews: vi.fn<GitHubSource["listReviews"]>(
+      async (prNumber) => data.reviews?.[prNumber] ?? [],
     ),
-    getCommitFiles: vi.fn(
-      async (sha: string) =>
+    listCommits: vi.fn<GitHubSource["listCommits"]>(
+      async () => data.commits ?? [],
+    ),
+    getCommitFiles: vi.fn<GitHubSource["getCommitFiles"]>(
+      async (sha) =>
         data.files?.[sha] ?? [
           { filename: "src/a.ts", additions: 1, deletions: 0 },
         ],
