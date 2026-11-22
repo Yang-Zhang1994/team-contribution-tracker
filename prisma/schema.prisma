@@ -1,5 +1,5 @@
-// Database schema. Auth.js tables only for now; domain models (courses,
-// teams, sprints, activity) are added with their features.
+// Database schema: Auth.js tables, then domain models added with their
+// features (courses, teams and synced GitHub activity so far).
 
 generator client {
   provider = "prisma-client"
@@ -11,15 +11,16 @@ datasource db {
 }
 
 model User {
-  id            String    @id @default(cuid())
+  id            String       @id @default(cuid())
   name          String?
-  email         String?   @unique
+  email         String?      @unique
   emailVerified DateTime?
   image         String?
   accounts      Account[]
   sessions      Session[]
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  memberships   Membership[]
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
 }
 
 model Account {
@@ -56,4 +57,132 @@ model VerificationToken {
   expires    DateTime
 
   @@id([identifier, token])
+}
+
+enum Role {
+  STAFF
+  STUDENT
+}
+
+model Course {
+  id          String       @id @default(cuid())
+  name        String
+  // IANA time zone; sprint windows are evaluated in it (US2-AC2).
+  timeZone    String
+  memberships Membership[]
+  teams       Team[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
+// A user's role in one course, and their team if they are a student in one.
+model Membership {
+  id        String   @id @default(cuid())
+  courseId  String
+  userId    String
+  role      Role
+  teamId    String?
+  course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team      Team?    @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([courseId, userId])
+  @@index([teamId])
+}
+
+model Team {
+  id          String       @id @default(cuid())
+  courseId    String
+  name        String
+  course      Course       @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  memberships Membership[]
+  repository  Repository?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([courseId])
+}
+
+// The team's linked GitHub repository (public only) and its sync state.
+model Repository {
+  id                String        @id @default(cuid())
+  teamId            String        @unique
+  owner             String
+  name              String
+  defaultBranch     String?
+  // Start time of the last successful sync; the next sync fetches from here.
+  lastSyncedAt      DateTime?
+  lastSyncStartedAt DateTime?
+  lastSyncError     String?
+  lastSyncErrorAt   DateTime?
+  team              Team          @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  pullRequests      PullRequest[]
+  commits           Commit[]
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  @@unique([owner, name])
+}
+
+// Synced activity stores GitHub user IDs, not app user IDs: authors are
+// matched to members when the data is read.
+
+model PullRequest {
+  id              String     @id @default(cuid())
+  repositoryId    String
+  githubId        BigInt     @unique
+  number          Int
+  authorGithubId  BigInt?
+  authorLogin     String?
+  title           String
+  url             String
+  baseRef         String
+  mergedAt        DateTime?
+  githubUpdatedAt DateTime
+  repository      Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  reviews         Review[]
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@unique([repositoryId, number])
+  @@index([repositoryId, mergedAt])
+}
+
+model Review {
+  id               String      @id @default(cuid())
+  pullRequestId    String
+  githubId         BigInt      @unique
+  reviewerGithubId BigInt?
+  reviewerLogin    String?
+  state            String
+  url              String
+  submittedAt      DateTime
+  pullRequest      PullRequest @relation(fields: [pullRequestId], references: [id], onDelete: Cascade)
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  @@index([pullRequestId])
+}
+
+model Commit {
+  id             String     @id @default(cuid())
+  repositoryId   String
+  sha            String
+  authorGithubId BigInt?
+  authorLogin    String?
+  authorName     String
+  authorEmail    String
+  authoredAt     DateTime
+  // Additions + deletions without lockfiles and generated files. Not capped:
+  // the 300-per-commit cap is applied when shares are computed (US4).
+  linesChanged   Int
+  url            String
+  repository     Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@unique([repositoryId, sha])
+  @@index([repositoryId, authoredAt])
 }
