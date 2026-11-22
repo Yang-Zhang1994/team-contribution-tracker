@@ -1,0 +1,1788 @@
+▗ ▗   ▖ ▖  Claude Code v2.1.308
+           Opus 5.5 · Claude Enterprise
+ ▘▘   ▝▝   ~/Documents/AI Coding Course/Project 3
+
+⚠ Your login expires in 3 days · run /login to renew
+
+❯ /clear                                                                        
+
+❯  Explore phase only, don't write or edit any code. Use Glob, Grep and Read to 
+  understand how the codebase works for US3 (GitHub sync, docs/PRD.md §5): how  
+  auth and sessions work, how we'd get a GitHub token for API calls, the        
+  Prisma setup and schema, and what Next.js 16 docs in node_modules say about   
+  route handlers and server actions. Report what exists, what US3 would touch,  
+  and open questions.                                                           
+
+  Ran 7 shell commands (ctrl+o to expand)
+
+⏺ I've finished reading the code and the Next 16 docs. Here's the report.
+
+  US3 (GitHub sync): exploration report
+
+  What exists today
+
+  The scaffold is very small: 8 source files, no domain code, and src/lib/ is
+  empty.
+
+  Auth (src/auth.ts)
+  - It's a bare NextAuth({ adapter: PrismaAdapter(prisma), providers: [GitHub] 
+    }) with no callbacks, no custom scopes and no session customization.
+  - Because a Prisma adapter is configured, sessions are stored in the database.
+    Each request looks up the Session row through the cookie.
+  - The GitHub provider's default scope is read:user user:email
+    (node_modules/@auth/core/providers/github.js:76). This scope can't read 
+    private repos.
+  - There is no proxy.ts (formerly middleware), so US1-AC3 (redirect signed-out
+    users) isn't done yet.
+  - auth(), signIn and signOut are only used in src/app/auth-status.tsx, which
+    renders inside <Suspense> as cacheComponents requires.
+
+  Where the GitHub token lives
+  - On sign-in, the adapter's linkAccount writes the OAuth token to
+    Account.access_token, together with scope, token_type and expires_at. The
+    row is keyed by (provider, providerAccountId), and providerAccountId is the
+    user's numeric GitHub ID.
+  - So the server can get a token like this:
+    prisma.account.findFirst({ where: { userId, provider: "github" }, select: { 
+    access_token: true } })
+  - It never needs to reach the session or the client. This fits the "tokens
+    never sent to client" rule, as long as the lookup is only done in
+    src/server/.
+  - Classic GitHub OAuth App tokens don't expire, so refresh_token will be null.
+    Token refresh only matters if we switch to a GitHub App with expiring user
+    tokens.
+
+  Prisma
+  - prisma/schema.prisma only has the Auth.js tables: User, Account, Session and
+    VerificationToken.
+  - The client is generated to src/generated/prisma, and the singleton is
+    src/server/db.ts, which uses the PrismaPg adapter.
+  - There's no prisma/migrations/ directory yet. The first migrate dev will
+    create the initial migration, including the auth tables.
+  - User has no GitHub login or ID field. The GitHub ID is only on
+    Account.providerAccountId, and the login name isn't stored anywhere.
+
+  Dependencies
+  - Octokit and server-only aren't installed. Installing them goes through the
+    "ask" permission rule.
+
+  What the Next.js 16 docs say
+
+  - Server actions (02-guides/server-actions.md, data-security.md):
+    - Every action can be reached by a direct POST, so each one must re-check
+      auth and authorization itself.
+    - The docs recommend a Data Access Layer marked import 'server-only'.
+    - After a mutation, call refresh() or revalidatePath() from next/cache so
+      the same response re-renders the page.
+    - Use useActionState for the pending state.
+    - These fit the "Sync now" button well.
+  - Route handlers (01-getting-started/15-route-handlers.md):
+    - With cacheComponents, a GET handler is prerendered unless it touches
+      runtime data. One that calls auth() or the database runs on every request.
+    - POST handlers are never cached.
+    - You can't put a route.ts and a page.tsx in the same segment.
+    - Use RouteContext<'/path/[id]'> to type params.
+    - A route handler is the natural choice for a scheduled sync (a Vercel cron
+      calling an endpoint protected by a secret).
+  - maxDuration: a segment config that limits run time. For server actions, it's
+    set on the page. Syncing a busy repo with pagination could hit Vercel's
+    default limit.
+  - after(): runs work after the response is sent, within the same maxDuration.
+    It's an option if we want "Sync now" to return immediately.
+  - Proxy (16-proxy.md): the docs say it's only for quick, optimistic redirects.
+    Real authorization belongs in the data layer.
+
+  What US3 would touch
+
+  Area: Schema and migration
+  Files: Initial migration, plus models. US3 needs Course/Team/Membership from
+  US2 first, then Repository, PullRequest, Review, Commit (with per-file or
+  already-capped line counts), UnmatchedAuthor and a SyncRun/sync state (last
+  success, last error, cursor). Use GitHub IDs or SHAs as unique keys so
+  upserts never create duplicates (AC2).
+  ────────────────────────────────────────
+  Area: Pure logic in src/lib/
+  Files: Mapping raw GitHub payloads to records, filtering bots and merge
+  commits, excluding lockfiles and generated files, matching authors to
+  members, deciding which PRs and commits are new since the cursor, classifying
+   errors (rate limit vs. permission, for AC4).
+  ────────────────────────────────────────
+  Area: Server code in src/server/
+  Files: github.ts (Octokit client built from the stored token), sync.ts (fetch,
+
+  then the pure logic, then a Prisma upsert inside a transaction), and an
+  access-check helper.
+  ────────────────────────────────────────
+  Area: UI
+  Files: A team page with a "Sync now" server action, last-sync time, error
+  reason and the unmatched-authors list.
+  ────────────────────────────────────────
+  Area: Auth
+  Files: Probably extra scopes in src/auth.ts, plus a session callback that
+  exposes user.id. I haven't checked whether v5 includes it by default with
+  database sessions.
+
+  Open questions
+
+  1. Scopes vs. private repos. Classic OAuth Apps have no read-only scope for
+     private repos. repo gives full read and write, which conflicts with US1-AC1
+     / §6 "least privilege". Options:
+     - Require public repos only.
+     - Ask for repo and document why.
+     - Switch to a GitHub App with read-only Contents, Pull requests and
+       Metadata permissions. This changes the auth setup.
+  2. Whose token is used? The user who clicks "Sync now", or a stored token per
+     team? A staff member can't sync a team's private repo with their own token
+     unless they have access. A scheduled sync has no user present at all.
+  3. Is US2 a prerequisite? Sync needs teams, members and a linked repo. Should
+     US3 wait for those models, or bring in a minimal Team/Repository schema
+     itself?
+  4. Matching authors. Commit authors arrive as an email and name, plus a GitHub
+     author.login/id only when GitHub can link them. Should we match on GitHub
+     user ID (more reliable, requires storing the member's GitHub ID or login)
+     or also on email? How does linking an unmatched author (AC3) persist, for
+     example as an alias table?
+  5. Line counts. The list-commits endpoint doesn't return per-file stats, so
+     excluding lockfiles needs one request per commit, which costs rate limit.
+     Should we store per-file stats (flexible, bigger) or only a pre-filtered,
+     pre-capped total per commit?
+  6. "Since the last sync" vs. edited data. PRs merged earlier can get new
+     reviews, and force-pushes can rewrite default-branch history. Should we
+     re-scan a window that overlaps the last sync, and how do we treat commits
+     that are no longer on the branch?
+  7. Is the scheduled sync in scope? PRD §3 says "on demand or on a schedule."
+     Is a Vercel cron part of US3 or later?
+  8. Sync duration. Should "Sync now" run synchronously, with maxDuration set on
+     the page, or in the background with after() and a status display?
+  9. REST vs. GraphQL. GraphQL can fetch PRs, reviews and commit history in
+     fewer calls. REST is simpler to mock in tests.
+
+✻ Crunched for 51s · done 8:04 PM
+
+※ recap: You asked for a read-only look at the codebase for US3 (GitHub sync), and the report is done. Next, decide the open questions, starting with GitHub scopes for private repos and whose token runs the sync. (disable recaps in /config)
+
+!  git switch -c feat/1-github-sync                                             
+  ⎿  Switched to a new branch 'feat/1-github-sync'
+
+⏺ You're on feat/1-github-sync now. Nothing has changed yet, since the explore
+  phase was read-only.
+
+  Before planning, it would help to settle the questions that change the schema
+  and auth setup:
+
+  1. Scopes: public repos only, the repo scope, or a GitHub App?
+  2. Whose token: the user who clicks "Sync now", or one stored per team?
+  3. US2 dependency: should this branch include a minimal Team, Membership and
+     Repository schema, or wait for US2?
+  4. Line counts: store stats per file, or only a filtered total already capped
+     per commit?
+
+  Tell me your choices, or say "use your defaults" and I'll pick and state them.
+  Then I can write the plan and start the red/green cycle.
+
+✻ Brewed for 4s · done 8:24 PM
+
+※ recap: We're getting ready to build US3, GitHub sync, on the new branch feat/1-github-sync, and no code is written yet. Next, you choose how to handle repo scopes, whose token syncs, team schema setup and line counts, or tell me to use my defaults. (disable recaps in /config)
+
+❯ ▎ 1. Public repos only; no repo scope. Note a GitHub App as a future option   
+  in the plan. 2. Use the token of the user who clicks "Sync now", read         
+  server-side from the Auth.js Account table, never sent to the client. 3.      
+  Include a minimal Course, Team, Membership and Repository schema in this      
+  branch, without UI; US2 adds management later. Add a seed script so the sync  
+  can be tested. 4. Store one per-commit total with lockfiles and generated     
+  files excluded, computed by a pure function in src/lib/. Don't apply the      
+  300-line cap at storage; that belongs to US4. Now enter plan mode and write   
+  the plan.                                                                     
+
+⏺ Entered plan mode
+  Claude is now exploring and designing an implementation approach.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+⏺ Auth.js's default session callback drops user.id, and Prisma 7 seeds run via
+  migrations.seed in prisma.config.ts while tsx is missing. I'm writing the plan
+  next.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ User approved Claude's plan
+  ⎿  Plan saved to: ~/.claude/plans/bubbly-crafting-church.md · /plan to edit
+     US3 — GitHub sync (branch feat/1-github-sync, closes #1)
+
+     Context
+
+     Contribution shares (US4) and imbalance flags (US5) need each team's GitHub
+     activity stored locally. US3 adds a "Sync now" action that pulls merged
+     PRs, reviews and default-branch commits for a team's linked repository,
+     stores them without duplicates, lists unmatched commit authors, and fails
+     cleanly on rate-limit or permission errors (PRD §5 US3 AC1–AC4).
+
+     Decisions already made:
+     - Public repos only. Keep Auth.js's default GitHub scope (read:user 
+       user:email) and don't request repo. The user's token is only used to get
+       the 5,000 requests/hour rate limit.
+     - Token: the token of the user who clicks "Sync now", read on the server
+       from Account.access_token. It's never put in the session, never sent to
+       the client and never logged.
+     - Minimal Course / Team / Membership / Repository schema in this branch,
+       with no management UI (US2 adds that). A seed script makes sync testable.
+     - One stored line total per commit, with lockfiles and generated files
+       excluded, computed by a pure function in src/lib/. No 300-line cap when 
+       storing. The cap belongs to US4.
+
+     Future option (not in this branch): a GitHub App with read-only Contents,
+     Pull requests and Metadata permissions. It would allow private repos with
+     least privilege, and installation tokens would allow a scheduled sync with
+     no user present.
+
+     What exists (from exploration)
+
+     - src/auth.ts: bare NextAuth({ adapter: PrismaAdapter(prisma), providers: 
+       [GitHub] }) with database sessions. The default session callback
+       (@auth/core/lib/init.js:20) only returns name, email and image, so 
+       session.user.id is missing.
+     - Account.providerAccountId = the user's numeric GitHub ID, and
+       Account.access_token = their OAuth token. Both are written by the
+       adapter's linkAccount.
+     - src/server/db.ts: shared prisma singleton. Import it, never
+       @prisma/client.
+     - prisma/schema.prisma has only the Auth.js tables. There's no 
+       prisma/migrations/ directory yet.
+     - src/lib/ is empty. Octokit, server-only and tsx aren't installed.
+     - Next 16 docs: server actions can be reached by a direct POST, so each one
+       must re-check auth. Use refresh() from next/cache after the mutation and
+       useActionState for the pending state. maxDuration for actions is set on
+       the page.
+
+     Design
+
+     Matching authors
+
+     Match on the numeric GitHub user ID. The GitHub API gives author.id for
+     commits, user.id for PRs and reviews. A member's ID is their
+     Account.providerAccountId. Records don't store a user ID. Matching happens
+     when the data is read, through a pure function, so later membership changes
+     or linking unmatched authors don't need a re-sync. This needs no change to
+     User.
+
+     Schema (prisma/schema.prisma)
+
+     - Course { id, name, timeZone, createdAt, updatedAt }
+     - Membership { id, courseId, userId, role: Role (STAFF | STUDENT), teamId? 
+       }, @@unique([courseId, userId]). A student is in at most one team per
+       course.
+     - Team { id, courseId, name }, with relations to Membership[] and
+       Repository?
+     - Repository { id, teamId @unique, owner, name, defaultBranch?, 
+       lastSyncedAt?, lastSyncStartedAt?, lastSyncError?, lastSyncErrorAt? },
+       @@unique([owner, name]). Sync state lives here, so there's no separate
+       SyncRun table.
+     - PullRequest { id, repositoryId, githubId BigInt @unique, number, 
+       authorGithubId BigInt?, authorLogin?, title, url, baseRef, mergedAt?, 
+       updatedAt }, @@unique([repositoryId, number]). Unmerged PRs are stored
+       too, so reviews on them have a parent.
+     - Review { id, pullRequestId, githubId BigInt @unique, reviewerGithubId 
+       BigInt?, reviewerLogin?, state, url, submittedAt }
+     - Commit { id, repositoryId, sha, authorGithubId BigInt?, authorLogin?, 
+       authorName, authorEmail, authoredAt, linesChanged Int, url },
+       @@unique([repositoryId, sha])
+     - Indexes on (repositoryId, mergedAt), (repositoryId, authoredAt) and
+       (pullRequestId) for US4 window queries.
+
+     AC2 (no duplicates) is guaranteed by these unique keys plus upsert on them.
+
+     Pure domain logic in src/lib/ (strict TDD, close to 100% coverage)
+
+     These modules take plain types defined there. Zod schemas parse the raw
+     GitHub JSON, so src/lib never imports Octokit.
+     - src/lib/github/files.ts
+       - isExcludedFile(path): lockfiles (package-lock.json, yarn.lock,
+         pnpm-lock.yaml, bun.lock(b), Cargo.lock, poetry.lock, Gemfile.lock,
+         composer.lock, go.sum), generated or bundled files (*.min.js,
+         *.min.css, *.map, *.snap, paths under dist/, build/, .next/, coverage/,
+         node_modules/, **/generated/**).
+       - countLinesChanged(files) = Σ(additions + deletions) over files that
+         aren't excluded. Not capped.
+     - src/lib/github/activity.ts
+       - isBotAuthor(commit): login ending in [bot], type === "Bot", or, when
+         there's no linked author, a git author name ending in [bot].
+       - isMergeCommit(commit): more than one parent.
+       - toCommitRecord(commit, files): returns null for bot and merge commits.
+       - toPullRequestRecord(pr).
+       - toReviewRecord(review, prAuthorId): returns null for pending reviews
+         (no submitted_at) and self-reviews.
+       - dedupeBy(key): drops duplicates within a batch, for example when pages
+         overlap.
+     - src/lib/github/unmatched.ts: findUnmatchedAuthors(commits, 
+       memberGithubIds) returns one entry per distinct author (login, or name
+       and email), with a commit count and the latest commit date.
+     - src/lib/github/sync-window.ts: syncSince(lastSyncedAt, overlapHours = 24)
+       returns null for the first sync, which means a full history fetch. The
+       overlap is safe because records are upserted.
+     - src/lib/github/errors.ts: classifySyncError({ status, headers, message })
+       returns one of:
+       - rate_limited (403/429 with x-ratelimit-remaining: 0 or retry-after,
+         with reset time)
+       - not_found_or_private (404)
+       - forbidden (403)
+       - unauthorized (401, so the user needs to sign in again)
+       - unknown
+
+       Each kind has a plain-language message for the page.
+     - src/lib/access.ts: canAccessTeam(membership, teamId). Students only for
+       their own team, staff for any team in their course.
+
+     Server code in src/server/ (all files import "server-only")
+
+     - github-token.ts: getGitHubToken(userId) runs prisma.account.findFirst({ 
+       where: { userId, provider: "github" }, select: { access_token: true } }).
+       It throws a typed error if there's no token. The only place that reads 
+       the token.
+     - github-client.ts: wraps @octokit/rest behind a small GitHubSource
+       interface:
+       - getRepo
+       - listCommits(since), paginated, sha=defaultBranch
+       - getCommitFiles(sha)
+       - listPullsUpdatedSince(since): state=all, sort=updated, direction=desc,
+         stopping once updated_at < since, and keeping only base === 
+         defaultBranch
+       - listReviews(prNumber)
+     - sync.ts: runSync({ repo, source, store, now }) with injected
+       dependencies, so it can be tested without a DB or network:
+       a. Mark the sync as started.
+       b. Fetch the repo and its default branch.
+       c. Fetch PRs updated since the window start, then reviews for each.
+       d. Fetch commits since the window start. Call getCommitFiles only for 
+          SHAs not already stored, to save rate limit.
+       e. Map everything with the pure functions.
+       f. Write it all in one transaction through store.saveActivity.
+       g. Set lastSyncedAt = startedAt and clear the error.
+
+       If anything fails, classify the error, call store.recordFailure(kind, 
+       message, now), leave lastSyncedAt unchanged and write no partial data
+       (AC4).
+     - sync-store.ts: the Prisma implementation of store, using upserts on the
+       unique keys inside prisma.$transaction.
+     - access.ts: requireTeamAccess(userId, teamId) loads the membership through
+       Prisma and calls canAccessTeam.
+
+     Auth (src/auth.ts)
+
+     - Add a callbacks.session that sets session.user.id = user.id, plus a
+       next-auth module augmentation for the type.
+     - No scope change.
+
+     UI (minimal, only what sync needs)
+
+     - src/app/teams/[teamId]/page.tsx: a server component. Request-time reads
+       go inside <Suspense>. It shows:
+       - the repository (owner/name)
+       - the last successful sync time
+       - the last error and when it happened
+       - counts of PRs, reviews and commits
+       - the unmatched authors list (AC3)
+
+       Set export const maxDuration = 60.
+     - src/app/teams/[teamId]/actions.ts: "use server" syncTeam(prevState, 
+       formData) does:
+       a. auth()
+       b. Zod-parse teamId
+       c. requireTeamAccess
+       d. getGitHubToken
+       e. runSync
+       f. refresh()
+
+       It returns { ok: true } | { ok: false, reason } and never includes the
+       token or raw errors.
+     - src/app/teams/[teamId]/sync-button.tsx: a client component using
+       useActionState, with a pending label.
+     - A signed-out user, or one who isn't a member, gets notFound() or a
+       redirect from the page. The action returns an error instead.
+
+     Seed script
+
+     - prisma/seed.ts, run through tsx and wired up as migrations.seed: "tsx 
+       prisma/seed.ts" in prisma.config.ts.
+     - It's idempotent (upserts):
+       - one course
+       - one team
+       - a Repository from the SEED_REPO=owner/name env var
+       - student memberships for every existing user with a GitHub Account, so
+         you sign in first and then seed
+       - optionally, SEED_STAFF_GITHUB_ID to make one of those users staff
+     - Add SEED_REPO to .env.example.
+
+     Dependencies (npm install asks for permission)
+
+     - @octokit/rest and server-only (runtime)
+     - tsx (dev)
+
+     Commit sequence (red, then green, then optional refactor, with each step 
+     its own commit)
+
+     1. chore(db): initial migration for Auth.js tables (npx prisma migrate dev 
+        --name init)
+     2. chore: add @octokit/rest, server-only, tsx
+     3. feat(db): add course, team, membership, repository and activity models
+        and its migration (--name github-sync). This is schema only, with no
+        test (it's declarative).
+     4. For each pure module, a test: commit then a feat: commit:
+        - files (exclusions, line totals)
+        - activity (bots, merges, self or pending reviews, dedupe)
+        - sync-window
+        - errors
+        - unmatched
+        - access
+     5. test(sync) / feat(sync): tests for runSync with a fake GitHubSource and
+        an in-memory store. They cover:
+        - AC1: fetches since the last sync, with the overlap
+        - AC2: running twice gives the same stored set, and commit files aren't
+          fetched again
+        - AC4: a rate limit midway leads to recordFailure, no saveActivity, and
+          lastSyncedAt unchanged
+     6. feat(server): the Prisma store, the token reader, the Octokit client and
+        requireTeamAccess. Wiring code only; the logic is already covered by
+        the tests.
+     7. feat(auth): expose user id in session
+     8. feat(sync): team page with Sync now action and unmatched authors
+     9. chore(db): seed script for a course, team and public repo
+
+     Test names follow the ACs, for example describe("US3-AC2: re-running a sync
+     never creates duplicates") and describe("US3-AC4: rate limit stops the 
+     sync and keeps last successful sync time"). Edge cases: bot and merge
+     commits, unmatched authors, self-reviews, pending reviews, lockfile-only
+     commits (0 lines), first sync (no cursor), empty repo.
+
+     Before every commit: npm run lint && npm run typecheck && npm test.
+
+     Verification
+
+     - npm test and npm run test:coverage: src/lib/github/* and
+       src/lib/access.ts close to 100%, and 70% or more overall.
+     - npm run lint, npm run typecheck, npm run build.
+     - Manual end-to-end:
+       a. Run npx prisma migrate dev.
+       b. Sign in with GitHub on npm run dev.
+       c. Set SEED_REPO to a small public repo and run npx prisma db seed.
+       d. Open /teams/<id> and click "Sync now". Counts and the last-sync time
+          appear.
+       e. Click it again. The counts don't change (AC2).
+       f. Commits by people who aren't members appear under unmatched authors
+          (AC3).
+       g. Point the repository at a missing or private repo and sync again. The
+          page shows "repository not found or private", and the last-sync time
+          stays the same (AC4).
+     - Grep check that access_token is only referenced in
+       src/server/github-token.ts and that it's never passed to console.* or
+       returned from actions.
+
+     Not in this branch
+
+     - Linking unmatched authors to members (US2/US4)
+     - Scheduled or cron sync
+     - Handling force-pushed history (commits that vanish stay stored)
+     - Commits with more than 300 changed files (GitHub truncates the file list,
+       so those are noted as undercounted)
+     - GitHub App migration
+     - Course and team management UI (US2)
+     - Share calculation and the 300-line cap (US4)
+
+⏺ The plan is approved. I'll start with step 1, the initial migration for the
+  Auth.js tables. This command asks for permission and needs DATABASE_URL in
+  your .env.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ A migration folder called 20261122031521_init_auth already exists, though I
+  didn't create it and git doesn't list it. I'm checking where it came from
+  before I go further.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ A teammate's commit 5319473 already added the init_auth migration, so my
+  migrate dev found nothing new and step 1 is done. I'm checking what else that
+  commit changed.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ That commit is on main as well, and it changes db.ts, prisma.config.ts and the
+  env vars. I'll read those files before going on.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The commit doesn't conflict with the plan, but the seed script will now build
+  its own Prisma client on DATABASE_URL_UNPOOLED, falling back to DATABASE_URL,
+  rather than importing src/server/db.ts. I'm noting that in the plan and then
+  installing the dependencies, which needs your permission.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npm install
+      @octokit/rest server-only && npm install -D tsx 2>&1 | tail -5; git
+      status --short)
+  ⎿  added 21 packages, and audited 605 packages in 1s
+
+     193 packages are looking for funding
+     … +22 lines (ctrl+o to expand)
+  ⎿  Updated package.json (+3 -0)
+      19      "@auth/prisma-adapter": "^2.11.3",
+      20      "@neon/config": "^1.14.6",
+      21      "@neon/env": "^2.1.9",
+      22 +    "@octokit/rest": "^22.0.1",                                
+      23      "@prisma/adapter-pg": "^7.10.1",
+      24      "@prisma/client": "^7.10.1",
+      25      "@vercel/functions": "^3.11.3",
+     ...
+      28      "pg": "^8.23.1",
+      29      "react": "19.3.0",
+      30      "react-dom": "19.3.0",
+      31 +    "server-only": "^0.0.1",                                   
+      32      "zod": "^4.6.7"
+      33    },
+      34    "devDependencies": {
+     ...
+      43      "prettier": "^3.10.1",
+      44      "prisma": "^7.10.1",
+      45      "tailwindcss": "4.3.3",
+      46 +    "tsx": "^4.23.15",                                         
+      47      "typescript": "^5",
+      48      "vitest": "^5.1.1"
+      49    }
+  ⎿  … 1 more file changed
+
+⏺ The install finished, but npm flagged 3 high-severity vulnerabilities and
+  blocked some install scripts (esbuild, prisma, fsevents). I'm checking whether
+  the new packages caused the vulnerabilities and confirming tsx runs without
+  its postinstall.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The vulnerabilities come through effect from prisma → @prisma/config and
+  predate this install, so they aren't from the new packages. Running lint,
+  typecheck and tests next, then committing step 2.
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Step 2 is committed. Now step 3: the schema models.
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(prisma/schema.prisma)
+  ⎿  Added 2 lines, removed 2 lines
+      1 -// Database schema. Auth.js tables only for now; domain models (
+        -courses,                                                        
+      2 -// teams, sprints, activity) are added with their features.     
+      1 +// Database schema: Auth.js tables, then domain models added wit
+        +h their                                                         
+      2 +// features (courses, teams and synced GitHub activity so far). 
+      3  
+      4  generator client {
+      5    provider = "prisma-client"
+
+⏺ Update(prisma/schema.prisma)
+  ⎿  Added 1 line
+      18    image         String?
+      19    accounts      Account[]
+      20    sessions      Session[]
+      21 +  memberships   Membership[]                                   
+      22    createdAt     DateTime  @default(now())
+      23    updatedAt     DateTime  @updatedAt
+      24  }
+
+⏺ Update(prisma/schema.prisma)
+  ⎿  Added 128 lines
+       58  
+       59    @@id([identifier, token])
+       60  }
+       61 +                                                              
+       62 +enum Role {                                                   
+       63 +  STAFF                                                       
+       64 +  STUDENT                                                     
+       65 +}                                                             
+       66 +                                                              
+       67 +model Course {                                                
+       68 +  id          String       @id @default(cuid())               
+       69 +  name        String                                          
+       70 +  // IANA time zone; sprint windows are evaluated in it (US2-A
+          +C2).                                                          
+       71 +  timeZone    String                                          
+       72 +  memberships Membership[]                                    
+       73 +  teams       Team[]                                          
+       74 +  createdAt   DateTime     @default(now())                    
+       75 +  updatedAt   DateTime     @updatedAt                         
+       76 +}                                                             
+       77 +                                                              
+       78 +// A user's role in one course, and their team if they are a s
+          +tudent in one.                                                
+       79 +model Membership {                                            
+       80 +  id        String   @id @default(cuid())                     
+       81 +  courseId  String                                            
+       82 +  userId    String                                            
+       83 +  role      Role                                              
+       84 +  teamId    String?                                           
+       85 +  course    Course   @relation(fields: [courseId], references:
+          + [id], onDelete: Cascade)                                     
+       86 +  user      User     @relation(fields: [userId], references: [
+          +id], onDelete: Cascade)                                       
+       87 +  team      Team?    @relation(fields: [teamId], references: [
+          +id], onDelete: SetNull)                                       
+       88 +  createdAt DateTime @default(now())                          
+       89 +  updatedAt DateTime @updatedAt                               
+       90 +                                                              
+       91 +  @@unique([courseId, userId])                                
+       92 +  @@index([teamId])                                           
+       93 +}                                                             
+       94 +                                                              
+       95 +model Team {                                                  
+       96 +  id          String       @id @default(cuid())               
+       97 +  courseId    String                                          
+       98 +  name        String                                          
+       99 +  course      Course       @relation(fields: [courseId], refer
+          +ences: [id], onDelete: Cascade)                               
+      100 +  memberships Membership[]                                    
+      101 +  repository  Repository?                                     
+      102 +  createdAt   DateTime     @default(now())                    
+      103 +  updatedAt   DateTime     @updatedAt                         
+      104 +                                                              
+      105 +  @@index([courseId])                                         
+      106 +}                                                             
+      107 +                                                              
+      108 +// The team's linked GitHub repository (public only) and its s
+          +ync state.                                                    
+      109 +model Repository {                                            
+      110 +  id                String        @id @default(cuid())        
+      111 +  teamId            String        @unique                     
+      112 +  owner             String                                    
+      113 +  name              String                                    
+      114 +  defaultBranch     String?                                   
+      115 +  // Start time of the last successful sync; the next sync fet
+          +ches from here.                                               
+      116 +  lastSyncedAt      DateTime?                                 
+      117 +  lastSyncStartedAt DateTime?                                 
+      118 +  lastSyncError     String?                                   
+      119 +  lastSyncErrorAt   DateTime?                                 
+      120 +  team              Team          @relation(fields: [teamId], 
+          +references: [id], onDelete: Cascade)                          
+      121 +  pullRequests      PullRequest[]                             
+      122 +  commits           Commit[]                                  
+      123 +  createdAt         DateTime      @default(now())             
+      124 +  updatedAt         DateTime      @updatedAt                  
+      125 +                                                              
+      126 +  @@unique([owner, name])                                     
+      127 +}                                                             
+      128 +                                                              
+      129 +// Synced activity stores GitHub user IDs, not app user IDs: a
+          +uthors are                                                    
+      130 +// matched to members when the data is read.                  
+      131 +                                                              
+      132 +model PullRequest {                                           
+      133 +  id              String     @id @default(cuid())             
+      134 +  repositoryId    String                                      
+      135 +  githubId        BigInt     @unique                          
+      136 +  number          Int                                         
+      137 +  authorGithubId  BigInt?                                     
+      138 +  authorLogin     String?                                     
+      139 +  title           String                                      
+      140 +  url             String                                      
+      141 +  baseRef         String                                      
+      142 +  mergedAt        DateTime?                                   
+      143 +  githubUpdatedAt DateTime                                    
+      144 +  repository      Repository @relation(fields: [repositoryId],
+          + references: [id], onDelete: Cascade)                         
+      145 +  reviews         Review[]                                    
+      146 +  createdAt       DateTime   @default(now())                  
+      147 +  updatedAt       DateTime   @updatedAt                       
+      148 +                                                              
+      149 +  @@unique([repositoryId, number])                            
+      150 +  @@index([repositoryId, mergedAt])                           
+      151 +}                                                             
+      152 +                                                              
+      153 +model Review {                                                
+      154 +  id               String      @id @default(cuid())           
+      155 +  pullRequestId    String                                     
+      156 +  githubId         BigInt      @unique                        
+      157 +  reviewerGithubId BigInt?                                    
+      158 +  reviewerLogin    String?                                    
+      159 +  state            String                                     
+      160 +  url              String                                     
+      161 +  submittedAt      DateTime                                   
+      162 +  pullRequest      PullRequest @relation(fields: [pullRequestI
+          +d], references: [id], onDelete: Cascade)                      
+      163 +  createdAt        DateTime    @default(now())                
+      164 +  updatedAt        DateTime    @updatedAt                     
+      165 +                                                              
+      166 +  @@index([pullRequestId])                                    
+      167 +}                                                             
+      168 +                                                              
+      169 +model Commit {                                                
+      170 +  id             String     @id @default(cuid())              
+      171 +  repositoryId   String                                       
+      172 +  sha            String                                       
+      173 +  authorGithubId BigInt?                                      
+      174 +  authorLogin    String?                                      
+      175 +  authorName     String                                       
+      176 +  authorEmail    String                                       
+      177 +  authoredAt     DateTime                                     
+      178 +  // Additions + deletions without lockfiles and generated fil
+          +es. Not capped:                                               
+      179 +  // the 300-per-commit cap is applied when shares are compute
+          +d (US4).                                                      
+      180 +  linesChanged   Int                                          
+      181 +  url            String                                       
+      182 +  repository     Repository @relation(fields: [repositoryId], 
+          +references: [id], onDelete: Cascade)                          
+      183 +  createdAt      DateTime   @default(now())                   
+      184 +  updatedAt      DateTime   @updatedAt                        
+      185 +                                                              
+      186 +  @@unique([repositoryId, sha])                               
+      187 +  @@index([repositoryId, authoredAt])                         
+      188 +}                                                             
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npx prisma
+      format && npx prisma migrate dev --name github-sync 2>&1 | tail -12)
+  ⎿  Loaded Prisma config from prisma.config.ts.
+
+     Prisma schema loaded from prisma/schema.prisma.
+     … +14 lines (ctrl+o to expand)
+  ⎿  Created prisma/migrations/20261122044653_github_sync/migration.sql
+     (+167 -0)
+        1 +-- CreateEnum                                                 
+        2 +CREATE TYPE "Role" AS ENUM ('STAFF', 'STUDENT');              
+        3 +                                                              
+        4 +-- CreateTable                                                
+        5 +CREATE TABLE "Course" (                                       
+        6 +    "id" TEXT NOT NULL,                                       
+        7 +    "name" TEXT NOT NULL,                                     
+        8 +    "timeZone" TEXT NOT NULL,                                 
+        9 +    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAM
+          +P,                                                            
+       10 +    "updatedAt" TIMESTAMP(3) NOT NULL,                        
+       11 +                                                              
+       12 +    CONSTRAINT "Course_pkey" PRIMARY KEY ("id")               
+       13 +);                                                            
+       14 +                                                              
+       15 +-- CreateTable                                                
+       16 +CREATE TABLE "Membership" (                                   
+       17 +    "id" TEXT NOT NULL,                                       
+       18 +    "courseId" TEXT NOT NULL,                                 
+       19 +    "userId" TEXT NOT NULL,                                   
+       20 +    "role" "Role" NOT NULL,                                   
+       21 +    "teamId" TEXT,                                            
+       22 +    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAM
+          +P,                                                            
+       23 +    "updatedAt" TIMESTAMP(3) NOT NULL,                        
+       24 +                                                              
+       25 +    CONSTRAINT "Membership_pkey" PRIMARY KEY ("id")           
+       26 +);                                                            
+       27 +                                                              
+       28 +-- CreateTable                                                
+       29 +CREATE TABLE "Team" (                                         
+       30 +    "id" TEXT NOT NULL,                                       
+       31 +    "courseId" TEXT NOT NULL,                                 
+       32 +    "name" TEXT NOT NULL,                                     
+       33 +    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAM
+          +P,                                                            
+       34 +    "updatedAt" TIMESTAMP(3) NOT NULL,                        
+       35 +                                                              
+       36 +    CONSTRAINT "Team_pkey" PRIMARY KEY ("id")                 
+       37 +);                                                            
+       38 +                                                              
+       39 +-- CreateTable                                                
+       40 +CREATE TABLE "Repository" (                                   
+     … 127 more lines (ctrl+o to expand)
+  ⎿  Updated prisma/schema.prisma (+4 -4)
+      11  }
+      12  
+      13  model User {
+      14 -  id            String    @id @default(cuid())                 
+      14 +  id            String       @id @default(cuid())              
+      15    name          String?
+      16 -  email         String?   @unique                              
+      16 +  email         String?      @unique                           
+      17    emailVerified DateTime?
+      18    image         String?
+      19    accounts      Account[]
+      20    sessions      Session[]
+      21    memberships   Membership[]
+      22 -  createdAt     DateTime  @default(now())                      
+      23 -  updatedAt     DateTime  @updatedAt                           
+      22 +  createdAt     DateTime     @default(now())                   
+      23 +  updatedAt     DateTime     @updatedAt                        
+      24  }
+      25  
+      26  model Account {
+  ⎿  (timeout 3m)
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Steps 1–3 are done: the migration, the dependencies, and the schema with its
+  migration. Next is the strict red/green work on the pure modules, so I'm
+  loading the TDD skill first.
+
+⏺ Skill(superpowers:test-driven-development)
+  ⎿  Successfully loaded skill
+
+⏺ The TDD skill is loaded. First red/green cycle: src/lib/github/files.ts
+  (excluding lockfiles and generated files, and summing lines per commit).
+  Writing the failing test first.
+
+⏺ Write(src/lib/github/files.test.ts)
+  ⎿  Wrote 90 lines to src/lib/github/files.test.ts
+       1 import { describe, expect, it } from "vitest";
+       2 import { countLinesChanged, isExcludedFile } from "./files";
+       3 
+       4 describe("PRD §4.1: lines changed exclude lockfiles and generate
+         d files", () => {
+       6     it.each([
+       7       "package-lock.json",
+       8       "frontend/package-lock.json",
+       9       "yarn.lock",
+      10       "pnpm-lock.yaml",
+     … +85 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ It fails as expected: ./files doesn't exist yet. Committing the red test.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Now the minimum implementation to make it pass:
+
+⏺ Write(src/lib/github/files.ts)
+  ⎿  Wrote 48 lines to src/lib/github/files.ts
+       1 // Which changed files count toward "lines changed" (PRD §4.1).
+       2 
+       3 export type ChangedFile = {
+       4   filename: string;
+       5   additions: number;
+       6   deletions: number;
+       7 };
+       8 
+       9 const LOCKFILES = new Set([
+      10   "package-lock.json",
+     … +42 lines (ctrl+o to expand)
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ The first test cycle is green with 34 passing tests. I'm writing failing tests
+  for activity.ts next, covering how GitHub commits, PRs and reviews map to
+  records.
+
+⏺ Write(src/lib/github/activity.test.ts)
+  ⎿  Wrote 242 lines to src/lib/github/activity.test.ts
+       1 import { describe, expect, it } from "vitest";
+       2 import {
+       3   dedupeBy,
+       4   isBotAuthor,
+       5   isMergeCommit,
+       6   toCommitRecord,
+       7   toPullRequestRecord,
+       8   toReviewRecord,
+       9   type GitHubCommit,
+      10   type GitHubPull,
+     … +248 lines (ctrl+o to expand)
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npx
+      prettier --write src/lib/github/activity.test.ts >/dev/null && npx vitest
+      run src/lib/github/a…)
+  ⎿  Error: Cannot find module './activity' imported from /Users/samuelcoe/
+     Documents/AI Coding Course/Project 3/src/lib/github/activity.test.ts
+      Test Files  1 failed (1)
+  ⎿  Updated src/lib/github/activity.test.ts (+9 -5)
+      64  
+      65    it("detects a linked bot account by type", () => {
+      66      expect(
+      67 -      isBotAuthor(commit({ author: { id: 1, login: "renovate", 
+         -type: "Bot" } })),                                             
+      67 +      isBotAuthor(                                             
+      68 +        commit({ author: { id: 1, login: "renovate", type: "Bot
+         +" } }),                                                        
+      69 +      ),                                                       
+      70      ).toBe(true);
+      71    });
+      72  
+     ...
+       98  
+       99  describe("PRD §4.1: merge commits are ignored", () => {
+      100    it("treats a commit with two parents as a merge", () => {
+       99 -    expect(isMergeCommit(commit({ parents: [{ sha: "a" }, { sh
+          -a: "b" }] }))).toBe(                                          
+      100 -      true,                                                   
+      101 -    );                                                        
+      101 +    expect(                                                   
+      102 +      isMergeCommit(commit({ parents: [{ sha: "a" }, { sha: "b
+          +" }] })),                                                     
+      103 +    ).toBe(true);                                             
+      104    });
+      105  
+      106    it("treats a commit with one parent as a normal commit", () 
+           => {
+     ...
+      217    });
+      218  
+      219    it("drops a review with a null submitted_at", () => {
+      218 -    expect(toReviewRecord(review({ submitted_at: null }), prAu
+          -thorId)).toBeNull();                                          
+      220 +    expect(                                                   
+      221 +      toReviewRecord(review({ submitted_at: null }), prAuthorI
+          +d),                                                           
+      222 +    ).toBeNull();                                             
+      223    });
+      224  
+      225    it("keeps a review when the PR author is unknown", () => {
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Committed the red test, failing because ./activity is missing. Now the
+  implementation:
+
+⏺ Write(src/lib/github/activity.ts)
+  ⎿  Wrote 140 lines to src/lib/github/activity.ts
+       1 // Maps GitHub API payloads to the records we store, applying th
+         e counting
+       2 // rules of PRD §4.1 that can be decided at sync time.
+       4 import { countLinesChanged, type ChangedFile } from "./files";
+       5 
+       6 // The subset of GitHub REST payloads we read.
+       7 export type GitHubUser = { id: number; login: string; type?: str
+       8 
+       9 export type GitHubCommit = {
+      10   sha: string;
+     … +138 lines (ctrl+o to expand)
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+⏺ The typecheck fails on the BigInt literals in the test because tsconfig
+  targets pre-ES2020, and Vitest missed it since it strips types. I'm changing
+  the test to use BigInt(101) and committing that fix on its own.
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && grep -n
+      "target" tsconfig.json; sed -E -i '' 's/([0-9]+)n([,)])/BigInt(\1)\2/g'
+      src/lib/github/act…)
+  ⎿  3:    "target": "ES2017",
+      src/lib/github/activity.test.ts | 10 +++++-----
+      1 file changed, 5 insertions(+), 5 deletions(-)
+     … +10 lines (ctrl+o to expand)
+  ⎿  Updated src/lib/github/activity.test.ts (+5 -5)
+      121    it("maps a commit with its author, author date and filtered 
+           line total", () => {
+      122      expect(toCommitRecord(commit(), files)).toEqual({
+      123        sha: "abc123",
+      124 -      authorGithubId: 101n,                                   
+      124 +      authorGithubId: BigInt(101),                            
+      125        authorLogin: "alex",
+      126        authorName: "Alex Kim",
+      127        authorEmail: "alex@example.com",
+     ...
+      160  describe("toPullRequestRecord", () => {
+      161    it("maps a merged PR", () => {
+      162      expect(toPullRequestRecord(pull())).toEqual({
+      163 -      githubId: 9001n,                                        
+      163 +      githubId: BigInt(9001),                                 
+      164        number: 7,
+      165 -      authorGithubId: 101n,                                   
+      165 +      authorGithubId: BigInt(101),                            
+      166        authorLogin: "alex",
+      167        title: "Add share calculation",
+      168        url: "https://github.com/o/r/pull/7",
+     ...
+      189  
+      190    it("maps a submitted review on someone else's PR", () => {
+      191      expect(toReviewRecord(review(), prAuthorId)).toEqual({
+      192 -      githubId: 5001n,                                        
+      193 -      reviewerGithubId: 202n,                                 
+      192 +      githubId: BigInt(5001),                                 
+      193 +      reviewerGithubId: BigInt(202),                          
+      194        reviewerLogin: "sam",
+      195        state: "APPROVED",
+      196        url: "https://github.com/o/r/pull/7#pullrequestreview-50
+           01",
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The activity module is green: 56 tests, plus lint and typecheck. Next is
+  sync-window.ts, which works out where an incremental sync starts.
+⏺ Write(src/lib/github/sync-window.test.ts)
+  ⎿  Wrote 26 lines to src/lib/github/sync-window.test.ts
+       1 import { describe, expect, it } from "vitest";
+       2 import { syncSince } from "./sync-window";
+       3 
+         ) => {
+       5   it("fetches full history on the first sync", () => {
+       6     expect(syncSince(null)).toBeNull();
+       7   });
+       9   it("starts 24 hours before the last successful sync by default
+         ", () => {
+      10     expect(syncSince(new Date("2026-11-25T12:00:00Z"))).toEqual(
+     … +18 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Write(src/lib/github/sync-window.ts)
+  ⎿  Wrote 13 lines to src/lib/github/sync-window.ts
+       1 const HOUR_MS = 60 * 60 * 1000;
+       2 
+       3 // Where an incremental sync starts fetching. Re-fetching an ove
+       4 // because records are upserted by their GitHub keys, and it cat
+         ches activity
+       5 // whose timestamp is earlier than when GitHub made it visible.
+       6 // null means first sync: fetch the full history.
+       8   lastSyncedAt: Date | null,
+       9   overlapHours = 24,
+      10 ): Date | null {
+     … +5 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ sync-window is green (60 tests total). Next is errors.ts: classifying GitHub
+  failures into plain reasons for AC4.
+
+⏺ Write(src/lib/github/errors.test.ts)
+  ⎿  Wrote 91 lines to src/lib/github/errors.test.ts
+       1 import { describe, expect, it } from "vitest";
+       2 import { classifySyncError } from "./errors";
+       3 
+       5 
+       6 describe("US3-AC4: GitHub errors stop the sync with a plain reas
+         on", () => {
+       7   it("classifies a 403 with no remaining quota as a rate limit w
+       8     const result = classifySyncError(
+       9       {
+      10         status: 403,
+     … +95 lines (ctrl+o to expand)
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npx
+      prettier --write src/lib/github/errors.test.ts >/dev/null && npx vitest
+      run src/lib/github/err…)
+  ⎿  Error: Cannot find module './errors' imported from /Users/samuelcoe/Do
+     cuments/AI Coding Course/Project 3/src/lib/github/errors.test.ts
+           2| import { classifySyncError } from "./errors";
+     9f583cd test(sync): classify GitHub rate-limit and permission errors
+  ⎿  Updated src/lib/github/errors.test.ts (+6 -2)
+      10          status: 403,
+      11          headers: {
+      12            "x-ratelimit-remaining": "0",
+      13 -          "x-ratelimit-reset": String(Date.parse("2026-11-25T12
+         -:30:00Z") / 1000),                                             
+      13 +          "x-ratelimit-reset": String(                         
+      14 +            Date.parse("2026-11-25T12:30:00Z") / 1000,         
+      15 +          ),                                                   
+      16          },
+      17        },
+      18        now,
+     ...
+      66    });
+      67  
+      68    it("classifies a non-HTTP error (e.g. network failure) as unk
+          nown", () => {
+      67 -    expect(classifySyncError(new Error("ECONNRESET"), now).kind
+         -).toBe("unknown");                                             
+      69 +    expect(classifySyncError(new Error("ECONNRESET"), now).kind
+         +).toBe(                                                        
+      70 +      "unknown",                                               
+      71 +    );                                                         
+      72      expect(classifySyncError("boom", now).kind).toBe("unknown")
+          ;
+      73      expect(classifySyncError(null, now).kind).toBe("unknown");
+      74    });
+
+⏺ Committed the red test. Now the implementation. It takes unknown, so Octokit
+  errors, network errors and anything else are all handled safely:
+
+⏺ Write(src/lib/github/errors.ts)
+  ⎿  Wrote 76 lines to src/lib/github/errors.ts
+       1 // Turns a failed GitHub request into a reason we can show on th
+         e team page
+       2 // (US3-AC4). The raw error is never passed through: it can carr
+       3 // details we must not display or store.
+       4 
+       5 export type SyncErrorKind =
+       6   | "rate_limited"
+       8   | "forbidden"
+       9   | "unauthorized"
+      10   | "unknown";
+     … +76 lines (ctrl+o to expand)
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npx
+      prettier --write src/lib/github/errors.ts >/dev/null && npx vitest run
+      src/lib/github/errors.t…)
+  ⎿        Tests  10 passed (10)
+  ⎿  Updated src/lib/github/errors.ts (+3 -1)
+      53  }
+      54  
+      55  function classify(kind: SyncErrorKind, retryAt?: Date): SyncErr
+          or {
+      56 -  return retryAt ? { kind, message: MESSAGES[kind], retryAt } :
+         - { kind, message: MESSAGES[kind] };                            
+      56 +  return retryAt                                               
+      57 +    ? { kind, message: MESSAGES[kind], retryAt }               
+      58 +    : { kind, message: MESSAGES[kind] };                       
+      59  }
+      60  
+      61  export function classifySyncError(error: unknown, now: Date): S
+          yncError {
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ errors.ts is green (70 tests). Next is unmatched.ts for AC3: listing commit
+  authors who aren't team members.
+
+⏺ Write(src/lib/github/unmatched.test.ts)
+  ⎿  Wrote 118 lines to src/lib/github/unmatched.test.ts
+       1 import { describe, expect, it } from "vitest";
+       2 import { findUnmatchedAuthors, type AuthoredCommit } from "./unm
+         atched";
+       4 function commit(overrides: Partial<AuthoredCommit> = {}): Author
+         edCommit {
+       5   return {
+       6     authorGithubId: BigInt(101),
+       8     authorName: "Alex Kim",
+       9     authorEmail: "alex@example.com",
+      10     authoredAt: new Date("2026-11-24T10:00:00Z"),
+     … +118 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Write(src/lib/github/unmatched.ts)
+  ⎿  Wrote 58 lines to src/lib/github/unmatched.ts
+      1 // Commit authors that can't be matched to a team member (US3-AC3
+        ). They are
+      2 // listed for the team and not counted (PRD §4.1).
+      3 
+      4 import type { CommitRecord } from "./activity";
+      6 export type AuthoredCommit = Pick<
+      7   CommitRecord,
+      8   "authorGithubId" | "authorLogin" | "authorName" | "authorEmail"
+         | "authoredAt"
+      9 >;
+     … +52 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ unmatched is green (77 tests). Next is src/lib/access.ts, the pure rule for
+  who can read and sync a team (PRD §6).
+
+⏺ Write(src/lib/access.test.ts)
+  ⎿  Wrote 58 lines to src/lib/access.test.ts
+       1 import { describe, expect, it } from "vitest";
+       2 import { canAccessTeam } from "./access";
+       3 
+       5 
+       6 describe("PRD §6: team data is only readable by its members and 
+         course staff", () => {
+       7   it("allows a student on the team", () => {
+       9       canAccessTeam(
+      10         { role: "STUDENT", courseId: "course-1", teamId: "team-1
+         " },
+     … +52 lines (ctrl+o to expand)
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npx
+      prettier --write src/lib/access.test.ts >/dev/null && npx vitest run
+      src/lib/access.test.ts 2>…)
+  ⎿  Error: Cannot find module './access' imported from /Users/samuelcoe/Do
+     cuments/AI Coding Course/Project 3/src/lib/access.test.ts
+     d550115 test(access): only team members and course staff can access a
+     team
+  ⎿  Updated src/lib/access.test.ts (+8 -2)
+      33  
+      34    it("allows staff of the team's course", () => {
+      35      expect(
+      36 -      canAccessTeam({ role: "STAFF", courseId: "course-1", team
+         -Id: null }, team),                                             
+      36 +      canAccessTeam(                                           
+      37 +        { role: "STAFF", courseId: "course-1", teamId: null }, 
+      38 +        team,                                                  
+      39 +      ),                                                       
+      40      ).toBe(true);
+      41    });
+      42  
+      43    it("denies staff of a different course", () => {
+      44      expect(
+      42 -      canAccessTeam({ role: "STAFF", courseId: "course-2", team
+         -Id: null }, team),                                             
+      45 +      canAccessTeam(                                           
+      46 +        { role: "STAFF", courseId: "course-2", teamId: null }, 
+      47 +        team,                                                  
+      48 +      ),                                                       
+      49      ).toBe(false);
+      50    });
+      51  
+
+⏺ Write(src/lib/access.ts)
+  ⎿  Wrote 19 lines to src/lib/access.ts
+       1 // Who may read or sync a team's data (PRD §6): its own students
+         , and staff
+       2 // of the team's course.
+       3 
+       4 export type MembershipAccess = {
+       6   courseId: string;
+       7   teamId: string | null;
+       8 };
+       9 
+      10 export type TeamRef = { id: string; courseId: string };
+     … +11 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ All 84 pure-module tests pass with lint and typecheck clean, so I'm starting
+  the step 5 runSync orchestration. Its sync.ts stays free of server-only,
+  Prisma and Octokit, so I can unit-test it with injected interfaces, and I'm
+  writing the failing tests first.
+
+⏺ Write(src/server/sync.test.ts)
+  ⎿  Wrote 365 lines to src/server/sync.test.ts
+       1 import { describe, expect, it, vi } from "vitest";
+       2 import type {
+       3   CommitRecord,
+       4   GitHubCommit,
+       5   GitHubPull,
+       6   GitHubReview,
+       7   PullRequestRecord,
+       8   ReviewRecord,
+       9 } from "@/lib/github/activity";
+      10 import type { ChangedFile } from "@/lib/github/files";
+     … +396 lines (ctrl+o to expand)
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npx
+      prettier --write src/server/sync.test.ts >/dev/null && npx vitest run
+      src/server/sync.test.ts…)
+  ⎿  Error: Cannot find module './sync' imported from /Users/samuelcoe/Docu
+     ments/AI Coding Course/Project 3/src/server/sync.test.ts
+     … +13 lines (ctrl+o to expand)
+  ⎿  Updated src/server/sync.test.ts (+33 -6)
+      134      });
+      135      const store = new MemoryStore();
+      136  
+      137 -    const result = await runSync({ lastSyncedAt: null, source,
+          - store, now: () => T0 });                                     
+      137 +    const result = await runSync({                            
+      138 +      lastSyncedAt: null,                                     
+      139 +      source,                                                 
+      140 +      store,                                                  
+      141 +      now: () => T0,                                          
+      142 +    });                                                       
+      143  
+      144      expect(source.listPullsUpdatedSince).toHaveBeenCalledWith(
+           null);
+      145      expect(source.listCommits).toHaveBeenCalledWith("main", nu
+           ll);
+     ...
+      188      await runSync({ lastSyncedAt: null, source, store, now: ()
+            => T0 });
+      189  
+      190      expect(source.listCommits).toHaveBeenCalledWith("trunk", n
+           ull);
+      186 -    expect([...store.pullRequests.values()].map((pr) => pr.num
+          -ber)).toEqual([1]);                                           
+      191 +    expect([...store.pullRequests.values()].map((pr) => pr.num
+          +ber)).toEqual([                                               
+      192 +      1,                                                      
+      193 +    ]);                                                       
+      194      expect(source.listReviews).not.toHaveBeenCalledWith(2);
+      195    });
+      196  
+     ...
+      275      };
+      276      const store = new MemoryStore();
+      277  
+      271 -    await runSync({ lastSyncedAt: null, source: fakeSource(dat
+          -a), store, now: () => T0 });                                  
+      278 +    await runSync({                                           
+      279 +      lastSyncedAt: null,                                     
+      280 +      source: fakeSource(data),                               
+      281 +      store,                                                  
+      282 +      now: () => T0,                                          
+      283 +    });                                                       
+      284      const second = fakeSource(data);
+      285      await runSync({
+      286        lastSyncedAt: store.lastSyncedAt,
+     ...
+      299      const source = fakeSource({ commits: [ghCommit("a"), ghCom
+           mit("a")] });
+      300      const store = new MemoryStore();
+      301  
+      290 -    const result = await runSync({ lastSyncedAt: null, source,
+          - store, now: () => T0 });                                     
+     … 35 more lines (ctrl+o to expand)
+
+⏺ The red test is committed and failing because ./sync doesn't exist yet. ESLint
+  also flagged unused parameters in the test's fake source, which I'll fix in a
+  separate refactor commit once the tests pass. Implementing now.
+
+⏺ Write(src/server/sync.ts)
+  ⎿  Wrote 125 lines to src/server/sync.ts
+       1 // Runs one repository sync (US3): fetch from GitHub, map with t
+         he pure rules
+         and the
+       3 // database are injected, so this module has no Prisma, Octokit 
+         or
+       5 
+       6 import {
+       7   dedupeBy,
+       9   isMergeCommit,
+      10   toCommitRecord,
+     … +127 lines (ctrl+o to expand)
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ All 13 orchestration tests pass. Running the full checks:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Now the refactor commit for the lint warnings. I'll type the fakes with
+  vi.fn<GitHubSource[...]> so the unused parameters can go:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/server/sync.test.ts)
+  ⎿  Added 11 lines, removed 9 lines
+      69  
+      70  function fakeSource(data: FakeData) {
+      71    const source = {
+      72 -    getDefaultBranch: vi.fn(async () => data.defaultBranch ?? "
+         -main"),                                                        
+      73 -    listPullsUpdatedSince: vi.fn(                              
+      74 -      async (_since: Date | null) => data.pulls ?? [],         
+      72 +    getDefaultBranch: vi.fn<GitHubSource["getDefaultBranch"]>( 
+      73 +      async () => data.defaultBranch ?? "main",                
+      74      ),
+      76 -    listReviews: vi.fn(                                        
+      77 -      async (prNumber: number) => data.reviews?.[prNumber] ?? [
+         -],                                                             
+      75 +    listPullsUpdatedSince: vi.fn<GitHubSource["listPullsUpdated
+         +Since"]>(                                                      
+      76 +      async () => data.pulls ?? [],                            
+      77      ),
+      79 -    listCommits: vi.fn(                                        
+      80 -      async (_branch: string, _since: Date | null) => data.comm
+         -its ?? [],                                                     
+      78 +    listReviews: vi.fn<GitHubSource["listReviews"]>(           
+      79 +      async (prNumber) => data.reviews?.[prNumber] ?? [],      
+      80      ),
+      82 -    getCommitFiles: vi.fn(                                     
+      83 -      async (sha: string) =>                                   
+      81 +    listCommits: vi.fn<GitHubSource["listCommits"]>(           
+      82 +      async () => data.commits ?? [],                          
+      83 +    ),                                                         
+      84 +    getCommitFiles: vi.fn<GitHubSource["getCommitFiles"]>(     
+      85 +      async (sha) =>                                           
+      86          data.files?.[sha] ?? [
+      87            { filename: "src/a.ts", additions: 1, deletions: 0 },
+      88          ],
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Lint is clean and 97 tests pass. Next is step 6, the server wiring: token
+  reader, Octokit client, Prisma store and access check. First I'll check the
+  installed Octokit's API.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Octokit v22 is ESM-only and its paginate.iterator lets PR listing stop early,
+  so I'm writing the four server modules next, with the token read in one place
+  only.
+
+⏺ Write(src/server/github-token.ts)
+  ⎿  Wrote 12 lines to src/server/github-token.ts
+       1 import "server-only";
+       2 import { prisma } from "@/server/db";
+       4 // The only place that reads a user's GitHub access token. Keep 
+         it on the
+       5 // server: never put it in the session, return it from an action
+       6 export async function getGitHubToken(userId: string): Promise<st
+         ring | null> {
+       7   const account = await prisma.account.findFirst({
+       9     select: { access_token: true },
+      10   });
+     … +5 lines (ctrl+o to expand)
+
+⏺ Write(src/server/github-client.ts)
+  ⎿  Wrote 97 lines to src/server/github-client.ts
+       1 import "server-only";
+       2 import { Octokit } from "@octokit/rest";
+       3 import type { GitHubCommit } from "@/lib/github/activity";
+       4 import type { GitHubSource } from "@/server/sync";
+       5 
+         ken only
+       7 // raises the rate limit; no repository scope is requested.
+       8 export function createGitHubSource(
+       9   token: string,
+      10   owner: string,
+     … +96 lines (ctrl+o to expand)
+
+⏺ Write(src/server/sync-store.ts)
+  ⎿  Wrote 74 lines to src/server/sync-store.ts
+       1 import "server-only";
+       2 import { prisma } from "@/server/db";
+       4 
+       5 // A first sync of a busy repository writes many rows.
+       6 const SAVE_TIMEOUT_MS = 60_000;
+       8 // Prisma-backed SyncStore for one repository. Rows are upserted
+          by their
+       9 // GitHub keys, so re-running a sync never duplicates them (US3-
+      10 export function createSyncStore(repositoryId: string): SyncStore
+          {
+     … +71 lines (ctrl+o to expand)
+
+⏺ Write(src/server/access.ts)
+  ⎿  Wrote 18 lines to src/server/access.ts
+       1 import "server-only";
+       2 import { canAccessTeam } from "@/lib/access";
+       3 import { prisma } from "@/server/db";
+       5 // Returns the team if the user may access it (PRD §6), otherwis
+         e null, so
+       6 // callers can't tell a missing team from a forbidden one.
+       7 export async function requireTeamAccess(userId: string, teamId: 
+       8   const team = await prisma.team.findUnique({
+       9     where: { id: teamId },
+      10     select: { id: true, courseId: true },
+     … +10 lines (ctrl+o to expand)
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npx
+      prettier --write src/server >/dev/null && npm run lint 2>&1 | grep -E
+      "warning|error|✖"; npm r…)
+  ⎿  src/server/access.ts(8,29): error TS2339: Property 'team' does not exi
+     st on type 'PrismaClient'.
+     src/server/access.ts(13,35): error TS2339: Property 'membership' does
+     … +19 lines (ctrl+o to expand)
+  ⎿  Updated src/server/github-client.ts (+20 -21)
+      55          since: since?.toISOString(),
+      56          per_page: 100,
+      57        });
+      58 -      return commits.map(                                      
+      59 -        (commit): GitHubCommit => ({                           
+      60 -          sha: commit.sha,                                     
+      61 -          html_url: commit.html_url,                           
+      62 -          parents: commit.parents,                             
+      63 -          author:                                              
+      64 -            commit.author && "login" in commit.author          
+      65 -              ? {                                              
+      66 -                  id: commit.author.id,                        
+      67 -                  login: commit.author.login,                  
+      68 -                  type: commit.author.type,                    
+      69 -                }                                              
+      70 -              : null,                                          
+      71 -          commit: {                                            
+      72 -            author: {                                          
+      73 -              name: commit.commit.author?.name ?? "",          
+      74 -              email: commit.commit.author?.email ?? "",        
+      75 -              date: commit.commit.author?.date ?? commit.commit
+         -.committer?.date ?? "",                                        
+      76 -            },                                                 
+      58 +      return commits.map((commit): GitHubCommit => ({          
+      59 +        sha: commit.sha,                                       
+      60 +        html_url: commit.html_url,                             
+      61 +        parents: commit.parents,                               
+      62 +        author:                                                
+      63 +          commit.author && "login" in commit.author            
+      64 +            ? {                                                
+      65 +                id: commit.author.id,                          
+      66 +                login: commit.author.login,                    
+      67 +                type: commit.author.type,                      
+      68 +              }                                                
+      69 +            : null,                                            
+      70 +        commit: {                                              
+      71 +          author: {                                            
+      72 +            name: commit.commit.author?.name ?? "",            
+      73 +            email: commit.commit.author?.email ?? "",          
+      74 +            date:                                              
+      75 +              commit.commit.author?.date ?? commit.commit.commi
+         +tter?.date ?? "",                                              
+     … 8 more lines (ctrl+o to expand)
+  ⎿  (timeout 5m)
+
+⏺ The Prisma client is just stale, since migrate dev didn't regenerate it.
+  Regenerating:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The checks are clean: typecheck, lint, and 97 tests. Committing step 6, which
+  is wiring only. As planned, its logic is covered by the pure-module and
+  runSync tests.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Next is step 7: putting user.id in the session.
+
+⏺ Write(src/auth.ts)
+  ⎿  Added 15 lines, removed 1 line
+       1  import { PrismaAdapter } from "@auth/prisma-adapter";
+       2 -import NextAuth from "next-auth";                              
+       2 +import NextAuth, { type DefaultSession } from "next-auth";     
+       3  import GitHub from "next-auth/providers/github";
+       4  import { prisma } from "@/server/db";
+       5  
+       6 +declare module "next-auth" {                                   
+       7 +  interface Session {                                          
+       8 +    user: { id: string } & DefaultSession["user"];             
+       9 +  }                                                            
+      10 +}                                                              
+      11 +                                                               
+      12  // GitHub is the only sign-in method: the app needs each user's
+           GitHub identity
+      13  // to match them to commits, PRs and reviews.
+      14  export const { handlers, auth, signIn, signOut } = NextAuth({
+      15    adapter: PrismaAdapter(prisma),
+      16    providers: [GitHub],
+      17 +  callbacks: {                                                 
+      18 +    // Database sessions: expose the user id for server-side au
+         +thorization.                                                   
+      19 +    // The GitHub token stays in the Account table and never en
+         +ters the session.                                              
+      20 +    session({ session, user }) {                               
+      21 +      session.user.id = user.id;                               
+      22 +      return session;                                          
+      23 +    },                                                         
+      24 +  },                                                           
+      25  });
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Next is step 8, the team page. Before writing it I'll check the Next 16 docs
+  on three things: segment config under cacheComponents (maxDuration in
+  particular), refresh(), and dynamic params.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Under cacheComponents, dynamic params must be read inside Suspense, while
+  maxDuration still works and refresh() only works in server actions. I'm
+  keeping the action thin and moving the server-side steps into
+  src/server/team-sync.ts, then writing the files.
+
+⏺ Write(src/server/team-sync.ts)
+  ⎿  Wrote 122 lines to src/server/team-sync.ts
+       1 import "server-only";
+       2 import { findUnmatchedAuthors } from "@/lib/github/unmatched";
+       3 import { requireTeamAccess } from "@/server/access";
+       4 import { prisma } from "@/server/db";
+       5 import { createGitHubSource } from "@/server/github-client";
+       6 import { getGitHubToken } from "@/server/github-token";
+       7 import { runSync } from "@/server/sync";
+       8 import { createSyncStore } from "@/server/sync-store";
+       9 
+      10 export type SyncOutcome = { ok: boolean; message: string };
+     … +123 lines (ctrl+o to expand)
+
+⏺ Write(src/app/teams/[teamId]/actions.ts)
+  ⎿  Wrote 24 lines to src/app/teams/[teamId]/actions.ts
+       1 "use server";
+       2 
+       4 import { z } from "zod";
+       5 import { auth } from "@/auth";
+       6 import { syncTeamRepository, type SyncOutcome } from "@/server/t
+       7 
+       8 const syncInput = z.object({ teamId: z.string().min(1).max(64) }
+         );
+      10 // Reachable by direct POST, so it authenticates and authorizes 
+         on its own.
+     … +20 lines (ctrl+o to expand)
+
+⏺ Write(src/app/teams/[teamId]/sync-button.tsx)
+  ⎿  Wrote 35 lines to src/app/teams/[teamId]/sync-button.tsx
+       1 "use client";
+       2 
+       3 import { useActionState } from "react";
+       4 import type { SyncOutcome } from "@/server/team-sync";
+       5 import { syncTeam } from "./actions";
+       6 
+       7 export function SyncButton({ teamId }: { teamId: string }) {
+       8   const [outcome, action, pending] = useActionState<
+       9     SyncOutcome | null,
+      10     FormData
+     … +28 lines (ctrl+o to expand)
+
+⏺ Write(src/app/teams/[teamId]/page.tsx)
+  ⎿  Wrote 110 lines to src/app/teams/[teamId]/page.tsx
+      1 import { notFound, redirect } from "next/navigation";
+      2 import { Suspense } from "react";
+      3 import { auth } from "@/auth";
+      4 import { getTeamSyncStatus } from "@/server/team-sync";
+      5 import { SyncButton } from "./sync-button";
+      6 
+      7 // Sync now runs as a server action on this page; a first sync of
+         a busy
+      8 // repository makes many GitHub requests.
+      9 export const maxDuration = 60;
+     … +117 lines (ctrl+o to expand)
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npx
+      prettier --write src >/dev/null && npm run typecheck 2>&1 | grep error;
+      npm run lint 2>&1 | gr…)
+  ⎿        Tests  97 passed (97)
+  ⎿  Updated src/app/teams/[teamId]/sync-button.tsx (+3 -1)
+      24          <p
+      25            role="status"
+      26            className={
+      27 -            outcome.ok ? "text-green-700 dark:text-green-400" :
+         - "text-red-700 dark:text-red-400"                              
+      27 +            outcome.ok                                         
+      28 +              ? "text-green-700 dark:text-green-400"           
+      29 +              : "text-red-700 dark:text-red-400"               
+      30            }
+      31          >
+      32            {outcome.message}
+  ⎿  (timeout 5m)
+
+⏺ Typecheck, lint and tests are clean. npm run build will catch any
+  cacheComponents or Suspense violations that typecheck can't see, so I'm
+  running it before committing:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Step 8 is committed, and the production build passes, with /teams/[teamId]
+  partially prerendered and the dynamic part streamed. Last is step 9, the seed
+  script.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Write(prisma/seed.ts)
+  ⎿  Wrote 101 lines to prisma/seed.ts
+      1 // Seeds one course, one team and its public repository so "Sync 
+        now" can be
+      3 //
+      4 // 1. Sign in with GitHub on the app at least once (creates your 
+        user).
+      6 // 3. npx prisma db seed, then open /teams/seed-team.
+      7 //
+      8 // Every user who has signed in becomes a student on the team, ex
+      9 // whose GitHub user ID is SEED_STAFF_GITHUB_ID (optional), who b
+        ecomes staff.
+     … +104 lines (ctrl+o to expand)
+
+⏺ Update(prisma.config.ts)
+  ⎿  Added 1 line
+       7    schema: "prisma/schema.prisma",
+       8    migrations: {
+       9      path: "prisma/migrations",
+      10 +    seed: "tsx prisma/seed.ts",                                
+      11    },
+      12    datasource: {
+      13      // Migrations need Neon's direct connection; the pooled one
+           (PgBouncer,
+
+⏺ Update(.env.example)
+  ⎿  Added 5 lines
+      10  # Callback URL: http://localhost:3000/api/auth/callback/github
+      11  AUTH_GITHUB_ID=""
+      12  AUTH_GITHUB_SECRET=""
+      13 +                                                               
+      14 +# Seed data for trying GitHub sync (npx prisma db seed): a publ
+         +ic repo, and                                                   
+      15 +# optionally the numeric GitHub user ID of a signed-in user to 
+         +make staff.                                                    
+      16 +SEED_REPO="owner/name"                                         
+      17 +SEED_STAFF_GITHUB_ID=""                                        
+
+⏺ A .env copied from the example will have SEED_STAFF_GITHUB_ID="", and the
+  ^\d+$ regex would reject that empty string. Fixing it so empty counts as
+  unset:
+
+⏺ Update(prisma/seed.ts)
+  ⎿  Added 6 lines, removed 1 line
+      18      SEED_REPO: z
+      19        .string()
+      20        .regex(/^[\w.-]+\/[\w.-]+$/, "SEED_REPO must look like ow
+          ner/name"),
+      21 -    SEED_STAFF_GITHUB_ID: z.string().regex(/^\d+$/).optional(),
+      21 +    // Empty (as in .env.example) means no staff user.         
+      22 +    SEED_STAFF_GITHUB_ID: z                                    
+      23 +      .string()                                                
+      24 +      .regex(/^\d*$/, "SEED_STAFF_GITHUB_ID must be a numeric G
+         +itHub user ID")                                                
+      25 +      .optional()                                              
+      26 +      .transform((id) => id || undefined),                     
+      27    })
+      28    .parse(process.env);
+      29  
+
+⏺ Bash(cd "/Users/samuelcoe/Documents/AI Coding Course/Project 3" && npx
+      prettier --write prisma/seed.ts prisma.config.ts .env.example >/dev/null
+      && npm run typecheck…)
+  ⎿  [error] No parser could be inferred for file "/Users/samuelcoe/Documen
+     ts/AI Coding Course/Project 3/.env.example".
+           Tests  97 passed (97)
+     … +2 lines (ctrl+o to expand)
+  ⎿  Updated prisma/seed.ts (+5 -1)
+      44  
+      45    await prisma.course.upsert({
+      46      where: { id: COURSE_ID },
+      47 -    create: { id: COURSE_ID, name: "CS6983 AI Coding", timeZone
+         -: "America/Los_Angeles" },                                     
+      47 +    create: {                                                  
+      48 +      id: COURSE_ID,                                           
+      49 +      name: "CS6983 AI Coding",                                
+      50 +      timeZone: "America/Los_Angeles",                         
+      51 +    },                                                         
+      52      update: {},
+      53    });
+      54    await prisma.team.upsert({
+  ⎿  (timeout 5m)
+
+⏺ All checks pass, and the Prettier error is harmless because .env.example has
+  no parser. I'm not running the real seed since it would write to your Neon
+  database, so I'm committing now.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ All nine plan steps are committed. Last, the plan's verification: coverage,
+  and checking the token is read in only one place.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ US3 is implemented on feat/1-github-sync in 22 commits. Lint, typecheck, npm 
+  run build and all 97 tests pass. Two things aren't done: overall line coverage
+  is 53%, below the 70% target, and I haven't tested the sync against real
+  GitHub. Nothing is pushed and no PR is open.
+
+  What was built
+  - Pure logic in src/lib/, each module test-first with separate red and green
+    commits:
+    - line totals per commit, without lockfiles or generated files
+    - turning GitHub commits, PRs and reviews into records, dropping bot and
+      merge commits, self-reviews and pending reviews
+    - the start time for an incremental sync (24h overlap)
+    - plain-language error reasons
+    - the list of unmatched authors
+    - the team access rule
+  - runSync (src/server/sync.ts) is tested with a fake GitHub and an in-memory
+    database. The tests cover AC1 (fetches only since the last sync), AC2 (a
+    second sync adds no duplicates and doesn't re-fetch known commits) and AC4
+    (an error records the reason, writes nothing and keeps the last sync time).
+  - Server wiring: the Octokit client, Prisma upserts in one transaction,
+    requireTeamAccess, and the token reader. The token is read in exactly one
+    place (src/server/github-token.ts:9) and is never logged, returned or put in
+    the session.
+  - /teams/[teamId] page with the "Sync now" button, last sync time, last error
+    and the unmatched authors list. The action checks sign-in and team access on
+    the server and validates input with Zod.
+  - Seed script: npx prisma db seed with SEED_REPO=owner/name set.
+
+  Things to know
+  - Coverage is 53% overall. src/lib/github and src/lib/access.ts are at 100% of
+    lines, and sync.ts is at 100%. The server wiring files are at 0%, as the
+    plan expected, and they pull the total down. Closing the gap means
+    mocked-Prisma tests for team-sync.ts, access.ts and sync-store.ts. Those
+    would be tests written after the code, not red/green, so I've held off until
+    you decide.
+  - Teammate commit: 5319473 (Neon setup and the first migration) appeared on
+    main and this branch after I explored. Plan step 1 was already done, so I
+    skipped it.
+  - Unplanned commit: the TypeScript target (ES2017) doesn't allow 101n BigInt
+    literals, so I added a separate test: commit switching to BigInt(101). The
+    assertions didn't change.
+  - The seed resets data when the repo changes. Changing SEED_REPO deletes the
+    old repo's synced activity. The AC4 manual check ("last sync time stays the
+    same") therefore has to be done by syncing a repo that becomes unreachable,
+    not by switching repos with the seed.
+  - Pre-existing vulnerabilities: npm audit reports 3 high-severity issues in
+    effect, which comes in through prisma. They were there before this branch.
+
+  To try it
+  1. Sign in with GitHub on npm run dev.
+  2. Set SEED_REPO to a public repo in .env and run npx prisma db seed.
+  3. Open /teams/seed-team and click "Sync now".
+  4. Click it again; the counts shouldn't change.
+
+  Do you want me to add the server tests to reach 70%, or push and open the PR
+  (Closes #1) as it is?
+
+✻ Cogitated for 11m 59s · done 9:55 PM
